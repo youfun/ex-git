@@ -1,0 +1,13 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/tmp/
+erl_crash.dump
+*.ez
+ex_git-*.tar
+.DS_Store
+priv/*.so
+priv/*.dylib
+priv/*.dll
+c_src/*.o
