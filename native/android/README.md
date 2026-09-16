@@ -1,8 +1,8 @@
 # Android native build
 
-Phase 1 uses the host `Makefile` and a system libgit2. Cross-compiling libgit2
-for `arm64-v8a` and `x86_64`, then packaging `ex_git_nif.so` next to the BEAM
-runtime, belongs here so Sigil never owns that toolchain.
+Host development uses the top-level `Makefile` and a system libgit2. This
+directory is not yet a working Android NDK build. Do not load ExGit on device
+until `arm64-v8a` / `x86_64` shared objects exist here.
 
 Planned output:
 

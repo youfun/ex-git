@@ -35,6 +35,26 @@ defmodule ExGitTest do
     assert is_binary(message) and byte_size(message) > 0
   end
 
+  test "open does not walk above the exclusive ceiling into a parent repository", %{dir: dir} do
+    GitCLI.init!(dir)
+    workspace = Path.join(dir, "workspace")
+    nested = Path.join(workspace, "nested")
+    File.mkdir_p!(nested)
+    ceiling = exclusive_parent(workspace)
+
+    assert {:error, {:not_found, _}} = ExGit.open(nested, ceiling: ceiling)
+    assert {:error, {:not_found, _}} = ExGit.open(workspace, ceiling: ceiling)
+
+    inner = Path.join(dir, "inner")
+    GitCLI.init!(inner)
+    nested_inner = Path.join(inner, "src")
+    File.mkdir_p!(nested_inner)
+
+    assert {:ok, repo} = ExGit.open(nested_inner, ceiling: exclusive_parent(inner))
+    assert {:ok, workdir} = ExGit.workdir(repo)
+    assert Path.expand(workdir) |> realpath() == Path.expand(inner) |> realpath()
+  end
+
   test "open reads a git-cli repository", %{dir: dir} do
     GitCLI.init!(dir)
     GitCLI.write!(dir, "README.md", "hi\n")
@@ -73,8 +93,14 @@ defmodule ExGitTest do
     assert {:ok, repo} = ExGit.init(dir)
     GitCLI.write!(dir, "mix.exs", "defmodule Demo.MixProject do\nend\n")
 
-    System.delete_env("GIT_AUTHOR_NAME")
-    System.delete_env("GIT_AUTHOR_EMAIL")
+    System.put_env("GIT_AUTHOR_NAME", "Env User")
+    System.put_env("GIT_AUTHOR_EMAIL", "env@example.com")
+
+    on_exit(fn ->
+      System.delete_env("GIT_AUTHOR_NAME")
+      System.delete_env("GIT_AUTHOR_EMAIL")
+    end)
+
     assert {:error, {:invalid, _}} = ExGit.commit(repo, "wip")
     assert :ok = ExGit.add(repo, ["mix.exs"])
     assert {:ok, oid1} = ExGit.commit(repo, "init project", @identity)
@@ -153,6 +179,60 @@ defmodule ExGitTest do
     assert GitCLI.rev_parse!(dir, "HEAD") == oid
   end
 
+  test "two handles serialize writes to the same on-disk repository", %{dir: dir} do
+    assert {:ok, repo_a} = ExGit.init(dir)
+    GitCLI.write!(dir, "a.txt", "seed\n")
+    assert :ok = ExGit.add(repo_a, "a.txt")
+    assert {:ok, _} = ExGit.commit(repo_a, "seed", @identity)
+    assert {:ok, repo_b} = ExGit.open(dir)
+
+    parent = self()
+
+    pid_a =
+      spawn(fn ->
+        File.write!(Path.join(dir, "a.txt"), "from-a\n")
+        send(parent, {:ready, :a})
+
+        receive do
+          :go ->
+            :ok = ExGit.add(repo_a, "a.txt")
+            {:ok, oid} = ExGit.commit(repo_a, "from a", @identity)
+            send(parent, {:done, :a, oid})
+        end
+      end)
+
+    pid_b =
+      spawn(fn ->
+        send(parent, {:ready, :b})
+
+        receive do
+          :go ->
+            File.write!(Path.join(dir, "b.txt"), "from-b\n")
+            :ok = ExGit.add(repo_b, "b.txt")
+            {:ok, oid} = ExGit.commit(repo_b, "from b", @identity)
+            send(parent, {:done, :b, oid})
+        end
+      end)
+
+    assert_receive {:ready, :a}, 1_000
+    assert_receive {:ready, :b}, 1_000
+    send(pid_a, :go)
+    send(pid_b, :go)
+
+    results =
+      for _ <- 1..2 do
+        assert_receive {:done, who, oid}, 5_000
+        {who, oid}
+      end
+
+    assert length(results) == 2
+    assert {:ok, log} = ExGit.log(repo_a, limit: 3)
+    summaries = Enum.map(log, & &1.summary)
+    assert "from a" in summaries
+    assert "from b" in summaries
+    assert GitCLI.rev_parse!(dir, "HEAD") in Enum.map(results, &elem(&1, 1))
+  end
+
   test "owner process death closes the native repository", %{dir: dir} do
     parent = self()
 
@@ -168,6 +248,11 @@ defmodule ExGitTest do
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
     assert {:error, {:closed, _}} = ExGit.status(repo)
+  end
+
+  defp exclusive_parent(path) do
+    parent = Path.dirname(Path.expand(path))
+    if parent == Path.expand(path), do: path, else: parent
   end
 
   defp realpath(path) do

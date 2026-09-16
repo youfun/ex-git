@@ -1,8 +1,8 @@
 # iOS native build
 
-Phase 1 uses the host `Makefile` and a system libgit2. Device and simulator
-libgit2 builds, linked into an XCFramework consumed by the host app, belong
-here so Sigil never owns that toolchain.
+Host development uses the top-level `Makefile` and a system libgit2. This
+directory is not yet a working iOS XCFramework. Do not load ExGit in the
+iOS app until device and simulator slices exist here.
 
 Planned output:
 

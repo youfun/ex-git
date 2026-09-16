@@ -9,8 +9,8 @@ defmodule ExGit do
   Remote clone/fetch/push, credentials, merge, and SSH are intentionally absent.
   Hosts such as Sigil own path permissions, tool protocol, UI, and credentials.
 
-  Every mutating call on a repository handle is serialized in the NIF. The
-  handle is bound to the calling process; sending it elsewhere is unsupported.
+  Mutating calls on the same on-disk repository are serialized across
+  handles. A handle is bound to the process that opened it.
   """
 
   alias ExGit.NIF
@@ -67,10 +67,28 @@ defmodule ExGit do
     wrap_repo(NIF.init(Path.expand(path)))
   end
 
-  @doc "Open an existing repository at `path` (a workdir or `.git` directory)."
-  @spec open(path()) :: {:ok, repo()} | error()
-  def open(path) when is_binary(path) do
-    wrap_repo(NIF.open(Path.expand(path)))
+  @doc """
+  Open an existing repository at `path` (a workdir or `.git` directory).
+
+  Options:
+
+    * `:ceiling` — exclusive upper bound for discovery (`GIT_CEILING_DIRECTORIES`).
+      libgit2 will not enter this directory while walking parents, so a
+      repository *at* `ceiling` is still found, and a repository *above* it
+      is not. Hosts should pass `Path.dirname(workspace)` so a repo at the
+      workspace root is found without walking out of the workspace.
+  """
+  @spec open(path(), keyword()) :: {:ok, repo()} | error()
+  def open(path, opts \\ []) when is_binary(path) do
+    expanded = Path.expand(path)
+
+    ceiling =
+      case Keyword.get(opts, :ceiling) do
+        nil -> default_ceiling(expanded)
+        value -> Path.expand(value)
+      end
+
+    wrap_repo(NIF.open(expanded, ceiling))
   end
 
   @doc "Working-tree path for an opened repository."
@@ -140,12 +158,13 @@ defmodule ExGit do
 
       ExGit.commit(repo, "fix compile", name: "Agent", email: "agent@local")
 
-  Falls back to `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` when options are omitted.
+  `name` and `email` are required. They are never read from the environment
+  or written to Git config.
   """
   @spec commit(repo(), String.t(), keyword()) :: {:ok, oid()} | error()
   def commit(%Repo{ref: ref}, message, opts \\ []) when is_binary(message) do
-    with {:ok, name} <- identity(opts, :name, "GIT_AUTHOR_NAME"),
-         {:ok, email} <- identity(opts, :email, "GIT_AUTHOR_EMAIL") do
+    with {:ok, name} <- required_identity(opts, :name),
+         {:ok, email} <- required_identity(opts, :email) do
       decode(NIF.commit(ref, message, name, email))
     end
   end
@@ -191,10 +210,17 @@ defmodule ExGit do
   defp decode({:error, reason}), do: {:error, {:error, to_string(reason)}}
   defp decode(other), do: other
 
-  defp identity(opts, key, env) do
-    case Keyword.get(opts, key) || System.get_env(env) do
+  defp required_identity(opts, key) do
+    case Keyword.get(opts, key) do
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, {:invalid, "author #{key} is required"}}
     end
+  end
+
+  # Exclusive ceiling: walk parents of `path`, but do not enter the parent of
+  # `path` itself. A repo at `path` is found; a repo above it is not.
+  defp default_ceiling(path) do
+    parent = Path.dirname(path)
+    if parent == path, do: path, else: parent
   end
 end

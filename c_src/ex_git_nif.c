@@ -7,14 +7,23 @@
 #define PATH_BUFSZ 4096
 #define HEX_BUFSZ (GIT_OID_MAX_HEXSIZE + 1)
 
+typedef struct repo_lock {
+    char *key;
+    ErlNifMutex *mutex;
+    unsigned refs;
+    struct repo_lock *next;
+} repo_lock;
+
 typedef struct {
     git_repository *repo;
-    ErlNifMutex *lock;
+    repo_lock *shared;
     ErlNifMonitor monitor;
     int monitored;
 } ex_git_repo;
 
 static ErlNifResourceType *REPO_RESOURCE = NULL;
+static ErlNifMutex *LOCK_TABLE_MUTEX = NULL;
+static repo_lock *LOCK_TABLE = NULL;
 
 static ERL_NIF_TERM ATOM_OK;
 static ERL_NIF_TERM ATOM_ERROR;
@@ -189,6 +198,96 @@ static int list_to_strarray(ErlNifEnv *env, ERL_NIF_TERM list, git_strarray *arr
     return 1;
 }
 
+static char *dup_c_string(const char *src)
+{
+    size_t len = strlen(src);
+    char *out = enif_alloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, src, len + 1);
+    return out;
+}
+
+static char *repo_lock_key(git_repository *repo)
+{
+    const char *path = git_repository_path(repo);
+    if (!path || !path[0]) {
+        path = git_repository_workdir(repo);
+    }
+    if (!path || !path[0]) {
+        return NULL;
+    }
+    return dup_c_string(path);
+}
+
+static repo_lock *acquire_repo_lock(const char *key)
+{
+    if (!LOCK_TABLE_MUTEX || !key) {
+        return NULL;
+    }
+
+    enif_mutex_lock(LOCK_TABLE_MUTEX);
+    for (repo_lock *cur = LOCK_TABLE; cur; cur = cur->next) {
+        if (strcmp(cur->key, key) == 0) {
+            cur->refs++;
+            enif_mutex_unlock(LOCK_TABLE_MUTEX);
+            return cur;
+        }
+    }
+
+    repo_lock *created = enif_alloc(sizeof(repo_lock));
+    if (!created) {
+        enif_mutex_unlock(LOCK_TABLE_MUTEX);
+        return NULL;
+    }
+    memset(created, 0, sizeof(*created));
+    created->key = dup_c_string(key);
+    created->mutex = enif_mutex_create("ex_git_repo_shared");
+    if (!created->key || !created->mutex) {
+        if (created->key) {
+            enif_free(created->key);
+        }
+        if (created->mutex) {
+            enif_mutex_destroy(created->mutex);
+        }
+        enif_free(created);
+        enif_mutex_unlock(LOCK_TABLE_MUTEX);
+        return NULL;
+    }
+    created->refs = 1;
+    created->next = LOCK_TABLE;
+    LOCK_TABLE = created;
+    enif_mutex_unlock(LOCK_TABLE_MUTEX);
+    return created;
+}
+
+static void release_repo_lock(repo_lock *lock)
+{
+    if (!lock || !LOCK_TABLE_MUTEX) {
+        return;
+    }
+
+    enif_mutex_lock(LOCK_TABLE_MUTEX);
+    repo_lock **slot = &LOCK_TABLE;
+    while (*slot) {
+        if (*slot == lock) {
+            if (--lock->refs == 0) {
+                *slot = lock->next;
+                enif_mutex_unlock(LOCK_TABLE_MUTEX);
+                enif_mutex_destroy(lock->mutex);
+                enif_free(lock->key);
+                enif_free(lock);
+                return;
+            }
+            enif_mutex_unlock(LOCK_TABLE_MUTEX);
+            return;
+        }
+        slot = &(*slot)->next;
+    }
+    enif_mutex_unlock(LOCK_TABLE_MUTEX);
+}
+
 static void close_repo_unlocked(ex_git_repo *r)
 {
     if (r->repo) {
@@ -201,12 +300,13 @@ static void repo_dtor(ErlNifEnv *env, void *obj)
 {
     (void)env;
     ex_git_repo *r = obj;
-    if (r->lock) {
-        enif_mutex_lock(r->lock);
+    repo_lock *shared = r->shared;
+    if (shared) {
+        enif_mutex_lock(shared->mutex);
         close_repo_unlocked(r);
-        enif_mutex_unlock(r->lock);
-        enif_mutex_destroy(r->lock);
-        r->lock = NULL;
+        enif_mutex_unlock(shared->mutex);
+        r->shared = NULL;
+        release_repo_lock(shared);
     } else {
         close_repo_unlocked(r);
     }
@@ -218,42 +318,52 @@ static void repo_down(ErlNifEnv *env, void *obj, ErlNifPid *pid, ErlNifMonitor *
     (void)pid;
     (void)mon;
     ex_git_repo *r = obj;
-    if (r->lock) {
-        enif_mutex_lock(r->lock);
+    repo_lock *shared = r->shared;
+    if (shared) {
+        enif_mutex_lock(shared->mutex);
         close_repo_unlocked(r);
         r->monitored = 0;
-        enif_mutex_unlock(r->lock);
+        enif_mutex_unlock(shared->mutex);
     }
     enif_release_resource(r);
 }
 
 static ERL_NIF_TERM wrap_repo(ErlNifEnv *env, git_repository *repo)
 {
+    char *key = repo_lock_key(repo);
+    repo_lock *shared = key ? acquire_repo_lock(key) : NULL;
+    if (key) {
+        enif_free(key);
+    }
+    if (!shared) {
+        git_repository_free(repo);
+        return make_error_term(env, ATOM_NOMEM, "cannot create repository lock");
+    }
+
     ex_git_repo *r = enif_alloc_resource(REPO_RESOURCE, sizeof(ex_git_repo));
     if (!r) {
         git_repository_free(repo);
+        release_repo_lock(shared);
         return make_error_term(env, ATOM_NOMEM, "out of memory");
     }
     memset(r, 0, sizeof(*r));
     r->repo = repo;
-    r->lock = enif_mutex_create("ex_git_repo");
-    if (!r->lock) {
-        git_repository_free(repo);
-        r->repo = NULL;
-        enif_release_resource(r);
-        return make_error_term(env, ATOM_NOMEM, "cannot create mutex");
-    }
+    r->shared = shared;
 
     ErlNifPid self;
     enif_self(env, &self);
-    ERL_NIF_TERM term = enif_make_resource(env, r);
-    if (enif_monitor_process(env, r, &self, &r->monitor) == 0) {
-        r->monitored = 1;
-        /* Keep the allocation ref so owner-down can close immediately. */
-        return make_ok(env, term);
+    if (enif_monitor_process(env, r, &self, &r->monitor) != 0) {
+        r->shared = NULL;
+        git_repository_free(repo);
+        r->repo = NULL;
+        enif_release_resource(r);
+        release_repo_lock(shared);
+        return make_error_term(env, ATOM_ERROR, "cannot monitor owner process");
     }
+    r->monitored = 1;
 
-    enif_release_resource(r);
+    ERL_NIF_TERM term = enif_make_resource(env, r);
+    /* Keep the allocation ref so owner-down can close immediately. */
     return make_ok(env, term);
 }
 
@@ -264,9 +374,12 @@ static int get_repo(ErlNifEnv *env, ERL_NIF_TERM term, ex_git_repo **out)
 
 static git_repository *lock_repo(ex_git_repo *r)
 {
-    enif_mutex_lock(r->lock);
+    if (!r->shared) {
+        return NULL;
+    }
+    enif_mutex_lock(r->shared->mutex);
     if (!r->repo) {
-        enif_mutex_unlock(r->lock);
+        enif_mutex_unlock(r->shared->mutex);
         return NULL;
     }
     return r->repo;
@@ -274,7 +387,9 @@ static git_repository *lock_repo(ex_git_repo *r)
 
 static void unlock_repo(ex_git_repo *r)
 {
-    enif_mutex_unlock(r->lock);
+    if (r->shared) {
+        enif_mutex_unlock(r->shared->mutex);
+    }
 }
 
 static ERL_NIF_TERM nif_loaded(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
@@ -309,12 +424,15 @@ static ERL_NIF_TERM nif_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 {
     (void)argc;
     char path[PATH_BUFSZ];
-    if (!inspect_cstr(env, argv[0], path, sizeof(path))) {
+    char ceiling[PATH_BUFSZ];
+    if (!inspect_cstr(env, argv[0], path, sizeof(path)) ||
+        !inspect_cstr(env, argv[1], ceiling, sizeof(ceiling))) {
         return enif_make_badarg(env);
     }
 
     git_repository *repo = NULL;
-    int error = git_repository_open_ext(&repo, path, 0, NULL);
+    const char *ceiling_dirs = ceiling[0] ? ceiling : NULL;
+    int error = git_repository_open_ext(&repo, path, 0, ceiling_dirs);
     if (error < 0) {
         return make_git_error(env, error, "open failed");
     }
@@ -1098,7 +1216,7 @@ static ERL_NIF_TERM nif_workdir(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 static ErlNifFunc nif_funcs[] = {
     {"loaded", 0, nif_loaded, 0},
     {"init", 1, nif_repo_init, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"open", 1, nif_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"open", 2, nif_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"status", 1, nif_status, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"diff", 4, nif_diff, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"add", 2, nif_add, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1153,6 +1271,11 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     ATOM_CLOSED = enif_make_atom(env, "closed");
     ATOM_NOMEM = enif_make_atom(env, "enomem");
 
+    LOCK_TABLE_MUTEX = enif_mutex_create("ex_git_lock_table");
+    if (!LOCK_TABLE_MUTEX) {
+        return -1;
+    }
+
     ErlNifResourceTypeInit init;
     memset(&init, 0, sizeof(init));
     init.dtor = repo_dtor;
@@ -1176,6 +1299,10 @@ static void on_unload(ErlNifEnv *env, void *priv_data)
     (void)env;
     (void)priv_data;
     git_libgit2_shutdown();
+    if (LOCK_TABLE_MUTEX) {
+        enif_mutex_destroy(LOCK_TABLE_MUTEX);
+        LOCK_TABLE_MUTEX = NULL;
+    }
 }
 
 ERL_NIF_INIT(Elixir.ExGit.NIF, nif_funcs, on_load, NULL, NULL, on_unload)

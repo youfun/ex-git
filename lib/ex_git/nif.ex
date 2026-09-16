@@ -17,7 +17,7 @@ defmodule ExGit.NIF do
   def loaded, do: false
 
   def init(_path), do: :erlang.nif_error(:nif_not_loaded)
-  def open(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def open(_path, _ceiling), do: :erlang.nif_error(:nif_not_loaded)
   def status(_repo), do: :erlang.nif_error(:nif_not_loaded)
   def diff(_repo, _mode, _from, _to), do: :erlang.nif_error(:nif_not_loaded)
   def add(_repo, _paths), do: :erlang.nif_error(:nif_not_loaded)
