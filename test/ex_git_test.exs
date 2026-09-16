@@ -233,6 +233,40 @@ defmodule ExGitTest do
     assert GitCLI.rev_parse!(dir, "HEAD") in Enum.map(results, &elem(&1, 1))
   end
 
+  test "clone fetch pull and push work against a local origin", %{dir: dir} do
+    seed = Path.join(dir, "seed")
+    origin = Path.join(dir, "origin.git")
+    clone_a = Path.join(dir, "a")
+    clone_b = Path.join(dir, "b")
+    GitCLI.init!(seed)
+    GitCLI.write!(seed, "README", "v1\n")
+    GitCLI.git!(seed, ["add", "README"])
+    GitCLI.git!(seed, ["commit", "-m", "v1"])
+    GitCLI.git!(dir, ["clone", "--bare", seed, origin])
+
+    assert {:error, {:invalid, _}} = ExGit.clone("ssh://git@example.com/repo.git", clone_a)
+    assert {:ok, repo_a} = ExGit.clone(origin, clone_a)
+    assert File.read!(Path.join(clone_a, "README")) == "v1\n"
+
+    GitCLI.write!(clone_a, "README", "v2\n")
+    assert :ok = ExGit.add(repo_a, "README")
+    assert {:ok, _} = ExGit.commit(repo_a, "v2", @identity)
+    assert :ok = ExGit.push(repo_a)
+
+    assert {:ok, repo_b} = ExGit.clone(origin, clone_b)
+    assert File.read!(Path.join(clone_b, "README")) == "v2\n"
+    assert :up_to_date = ExGit.pull(repo_b)
+
+    GitCLI.write!(clone_a, "README", "v3\n")
+    assert :ok = ExGit.add(repo_a, "README")
+    assert {:ok, _} = ExGit.commit(repo_a, "v3", @identity)
+    assert :ok = ExGit.push(repo_a)
+
+    assert :ok = ExGit.fetch(repo_b)
+    assert :fast_forward = ExGit.pull(repo_b)
+    assert File.read!(Path.join(clone_b, "README")) == "v3\n"
+  end
+
   test "owner process death closes the native repository", %{dir: dir} do
     parent = self()
 

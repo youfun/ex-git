@@ -32,8 +32,15 @@ Local working-tree history only:
 | `commit/3`, `log/2` | Persist history after compile/test |
 | `create_branch/3`, `checkout/3`, `branches/1` | Light local branching |
 
-Not in this phase: HTTPS `clone` / `fetch` / `push`, GitHub tokens, progress
-events, merge/conflict, SSH.
+Remote HTTPS:
+
+| Function | Notes |
+| --- | --- |
+| `clone/3` | `http(s)` or local path. Optional `username`/`password` via callback |
+| `fetch/2`, `push/2` | Default remote `origin` |
+| `pull/2` | Fetch + fast-forward only |
+
+Not supported: SSH, merge commits, tokens in the URL.
 
 ## Design rules
 

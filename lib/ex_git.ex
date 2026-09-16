@@ -6,8 +6,9 @@ defmodule ExGit do
 
       init/open → status/diff → add/reset → commit/log → branch/checkout
 
-  Remote clone/fetch/push, credentials, merge, and SSH are intentionally absent.
-  Hosts such as Sigil own path permissions, tool protocol, UI, and credentials.
+  HTTPS and local remotes support clone/fetch/push and fast-forward pull.
+  Credentials are passed per call and never written to the remote URL, logs,
+  or Git config. SSH and merge commits are out of scope.
 
   Mutating calls on the same on-disk repository are serialized across
   handles. A handle is bound to the process that opened it.
@@ -197,10 +198,47 @@ defmodule ExGit do
     decode(NIF.checkout(ref, name, force))
   end
 
+  @doc """
+  Clone `url` into `path`.
+
+  `url` must be `http://`, `https://`, `file://`, or a local filesystem path.
+  Optional `username`/`password` are supplied through libgit2's credential
+  callback and are never written into the URL.
+  """
+  @spec clone(String.t(), path(), keyword()) :: {:ok, repo()} | error()
+  def clone(url, path, opts \\ []) when is_binary(url) and is_binary(path) do
+    wrap_repo(NIF.clone(url, Path.expand(path), auth_term(opts)))
+  end
+
+  @doc "Fetch from `remote` (default `origin`)."
+  @spec fetch(repo(), keyword()) :: :ok | error()
+  def fetch(%Repo{ref: ref}, opts \\ []) do
+    decode(NIF.fetch(ref, remote_name(opts), auth_term(opts)))
+  end
+
+  @doc """
+  Fetch and fast-forward `HEAD` to its upstream.
+
+  Returns `:up_to_date` or `:fast_forward`. Diverged histories return
+  `{:error, {:conflict, _}}` instead of creating a merge commit.
+  """
+  @spec pull(repo(), keyword()) :: :up_to_date | :fast_forward | error()
+  def pull(%Repo{ref: ref}, opts \\ []) do
+    decode(NIF.pull(ref, remote_name(opts), auth_term(opts)))
+  end
+
+  @doc "Push the configured refspecs of `remote` (default `origin`)."
+  @spec push(repo(), keyword()) :: :ok | error()
+  def push(%Repo{ref: ref}, opts \\ []) do
+    decode(NIF.push(ref, remote_name(opts), auth_term(opts)))
+  end
+
   defp wrap_repo({:ok, ref}) when is_reference(ref), do: {:ok, %Repo{ref: ref}}
   defp wrap_repo(other), do: decode(other)
 
   defp decode(:ok), do: :ok
+  defp decode(:up_to_date), do: :up_to_date
+  defp decode(:fast_forward), do: :fast_forward
   defp decode({:ok, value}), do: {:ok, value}
 
   defp decode({:error, {code, message}}) when is_atom(code) and is_binary(message) do
@@ -222,5 +260,18 @@ defmodule ExGit do
   defp default_ceiling(path) do
     parent = Path.dirname(path)
     if parent == path, do: path, else: parent
+  end
+
+  defp remote_name(opts), do: Keyword.get(opts, :remote, "origin")
+
+  defp auth_term(opts) do
+    user = Keyword.get(opts, :username)
+    pass = Keyword.get(opts, :password)
+
+    if is_binary(user) and is_binary(pass) do
+      %{username: user, password: pass}
+    else
+      nil
+    end
   end
 end

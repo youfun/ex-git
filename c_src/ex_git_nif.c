@@ -61,6 +61,11 @@ static ERL_NIF_TERM ATOM_LOCKED;
 static ERL_NIF_TERM ATOM_NOTHING_TO_COMMIT;
 static ERL_NIF_TERM ATOM_CLOSED;
 static ERL_NIF_TERM ATOM_NOMEM;
+static ERL_NIF_TERM ATOM_AUTH;
+static ERL_NIF_TERM ATOM_FAST_FORWARD;
+static ERL_NIF_TERM ATOM_UP_TO_DATE;
+static ERL_NIF_TERM ATOM_USERNAME;
+static ERL_NIF_TERM ATOM_PASSWORD;
 
 static ERL_NIF_TERM make_binary(ErlNifEnv *env, const char *str)
 {
@@ -98,6 +103,8 @@ static ERL_NIF_TERM git_code_atom(int error)
         return ATOM_LOCKED;
     case GIT_EUNBORNBRANCH:
         return ATOM_UNBORN;
+    case GIT_EAUTH:
+        return ATOM_AUTH;
     default:
         return ATOM_ERROR;
     }
@@ -1196,6 +1203,315 @@ static ERL_NIF_TERM nif_checkout(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     return ATOM_OK;
 }
 
+typedef struct {
+    char username[256];
+    char password[1024];
+    int has_userpass;
+    int asked;
+} ex_git_auth;
+
+static int parse_auth(ErlNifEnv *env, ERL_NIF_TERM term, ex_git_auth *auth)
+{
+    memset(auth, 0, sizeof(*auth));
+    if (enif_is_identical(term, ATOM_NIL) || enif_is_identical(term, ATOM_FALSE)) {
+        return 1;
+    }
+    if (!enif_is_map(env, term)) {
+        return 0;
+    }
+
+    ERL_NIF_TERM user_term;
+    ERL_NIF_TERM pass_term;
+    if (!enif_get_map_value(env, term, ATOM_USERNAME, &user_term) ||
+        !enif_get_map_value(env, term, ATOM_PASSWORD, &pass_term)) {
+        return 0;
+    }
+    if (!inspect_cstr(env, user_term, auth->username, sizeof(auth->username)) ||
+        !inspect_cstr(env, pass_term, auth->password, sizeof(auth->password))) {
+        return 0;
+    }
+    auth->has_userpass = 1;
+    return 1;
+}
+
+static int credential_cb(git_credential **out, const char *url, const char *username_from_url,
+                         unsigned int allowed_types, void *payload)
+{
+    (void)url;
+    ex_git_auth *auth = payload;
+    if (!auth || !auth->has_userpass || auth->asked) {
+        return GIT_PASSTHROUGH;
+    }
+    if (!(allowed_types & GIT_CREDENTIAL_USERPASS_PLAINTEXT)) {
+        return GIT_PASSTHROUGH;
+    }
+    auth->asked = 1;
+    const char *user = auth->username[0] ? auth->username : (username_from_url ? username_from_url : "");
+    return git_credential_userpass_plaintext_new(out, user, auth->password);
+}
+
+static void apply_auth(git_remote_callbacks *callbacks, ex_git_auth *auth)
+{
+    callbacks->credentials = credential_cb;
+    callbacks->payload = auth;
+}
+
+static int url_is_allowed(const char *url)
+{
+    if (!url || !url[0]) {
+        return 0;
+    }
+    if (strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0 ||
+        strncmp(url, "file://", 7) == 0) {
+        return 1;
+    }
+    if (strstr(url, "://") != NULL) {
+        return 0;
+    }
+    return url[0] == '/' || url[0] == '.';
+}
+
+static ERL_NIF_TERM nif_clone(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    char url[PATH_BUFSZ];
+    char path[PATH_BUFSZ];
+    ex_git_auth auth;
+    if (!inspect_cstr(env, argv[0], url, sizeof(url)) ||
+        !inspect_cstr(env, argv[1], path, sizeof(path)) ||
+        !parse_auth(env, argv[2], &auth)) {
+        return enif_make_badarg(env);
+    }
+    if (!url_is_allowed(url)) {
+        return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+    }
+
+    git_clone_options opts = GIT_CLONE_OPTIONS_INIT;
+    apply_auth(&opts.fetch_opts.callbacks, &auth);
+
+    git_repository *repo = NULL;
+    int error = git_clone(&repo, url, path, &opts);
+    if (error < 0) {
+        return make_git_error(env, error, "clone failed");
+    }
+    return wrap_repo(env, repo);
+}
+
+static ERL_NIF_TERM nif_fetch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    char remote_name[256];
+    ex_git_auth auth;
+    if (!get_repo(env, argv[0], &r) ||
+        !inspect_cstr(env, argv[1], remote_name, sizeof(remote_name)) ||
+        !parse_auth(env, argv[2], &auth)) {
+        return enif_make_badarg(env);
+    }
+    if (remote_name[0] == 0) {
+        memcpy(remote_name, "origin", 7);
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    git_remote *remote = NULL;
+    int error = git_remote_lookup(&remote, repo, remote_name);
+    if (error == 0) {
+        const char *url = git_remote_url(remote);
+        if (!url_is_allowed(url)) {
+            git_remote_free(remote);
+            unlock_repo(r);
+            return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+        }
+        git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
+        apply_auth(&opts.callbacks, &auth);
+        error = git_remote_fetch(remote, NULL, &opts, "fetch");
+    }
+    if (remote) {
+        git_remote_free(remote);
+    }
+    unlock_repo(r);
+    if (error < 0) {
+        return make_git_error(env, error, "fetch failed");
+    }
+    return ATOM_OK;
+}
+
+static ERL_NIF_TERM nif_pull(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    char remote_name[256];
+    ex_git_auth auth;
+    if (!get_repo(env, argv[0], &r) ||
+        !inspect_cstr(env, argv[1], remote_name, sizeof(remote_name)) ||
+        !parse_auth(env, argv[2], &auth)) {
+        return enif_make_badarg(env);
+    }
+    if (remote_name[0] == 0) {
+        memcpy(remote_name, "origin", 7);
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    git_remote *remote = NULL;
+    git_reference *head = NULL;
+    git_reference *upstream = NULL;
+    git_annotated_commit *their = NULL;
+    git_merge_analysis_t analysis = GIT_MERGE_ANALYSIS_NONE;
+    git_merge_preference_t preference = GIT_MERGE_PREFERENCE_NONE;
+    (void)preference;
+    ERL_NIF_TERM result = ATOM_OK;
+    int error = git_remote_lookup(&remote, repo, remote_name);
+    if (error == 0) {
+        const char *url = git_remote_url(remote);
+        if (!url_is_allowed(url)) {
+            error = GIT_EINVALIDSPEC;
+        }
+    }
+    if (error == 0) {
+        git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
+        apply_auth(&opts.callbacks, &auth);
+        error = git_remote_fetch(remote, NULL, &opts, "pull");
+    }
+    if (error == 0) {
+        error = git_repository_head(&head, repo);
+    }
+    if (error == 0) {
+        error = git_branch_upstream(&upstream, head);
+    }
+    if (error == 0) {
+        error = git_annotated_commit_from_ref(&their, repo, upstream);
+    }
+    if (error == 0) {
+        const git_annotated_commit *heads[1] = {their};
+        error = git_merge_analysis(&analysis, &preference, repo, heads, 1);
+    }
+
+    if (error == 0 && (analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE)) {
+        result = ATOM_UP_TO_DATE;
+    } else if (error == 0 && (analysis & GIT_MERGE_ANALYSIS_FASTFORWARD)) {
+        git_checkout_options checkout_opts = GIT_CHECKOUT_OPTIONS_INIT;
+        checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE;
+        git_object *target = NULL;
+        error = git_object_lookup(&target, repo, git_annotated_commit_id(their), GIT_OBJECT_COMMIT);
+        if (error == 0) {
+            error = git_checkout_tree(repo, target, &checkout_opts);
+        }
+        if (error == 0) {
+            git_reference *updated = NULL;
+            error = git_reference_set_target(&updated, head, git_annotated_commit_id(their),
+                                             "pull: fast-forward");
+            if (updated) {
+                git_reference_free(updated);
+            }
+        }
+        if (target) {
+            git_object_free(target);
+        }
+        if (error == 0) {
+            result = ATOM_FAST_FORWARD;
+        }
+    } else if (error == 0) {
+        error = GIT_ECONFLICT;
+    }
+
+    if (their) {
+        git_annotated_commit_free(their);
+    }
+    if (upstream) {
+        git_reference_free(upstream);
+    }
+    if (head) {
+        git_reference_free(head);
+    }
+    if (remote) {
+        git_remote_free(remote);
+    }
+    unlock_repo(r);
+
+    if (error < 0) {
+        if (error == GIT_ECONFLICT) {
+            return make_error_term(env, ATOM_CONFLICT, "non-fast-forward pull is not supported");
+        }
+        if (error == GIT_EINVALIDSPEC) {
+            return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+        }
+        return make_git_error(env, error, "pull failed");
+    }
+    return result;
+}
+
+static ERL_NIF_TERM nif_push(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    char remote_name[256];
+    ex_git_auth auth;
+    if (!get_repo(env, argv[0], &r) ||
+        !inspect_cstr(env, argv[1], remote_name, sizeof(remote_name)) ||
+        !parse_auth(env, argv[2], &auth)) {
+        return enif_make_badarg(env);
+    }
+    if (remote_name[0] == 0) {
+        memcpy(remote_name, "origin", 7);
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    git_remote *remote = NULL;
+    git_reference *head = NULL;
+    char spec[PATH_BUFSZ];
+    spec[0] = 0;
+    int error = git_remote_lookup(&remote, repo, remote_name);
+    if (error == 0) {
+        const char *url = git_remote_url(remote);
+        if (!url_is_allowed(url)) {
+            git_remote_free(remote);
+            unlock_repo(r);
+            return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+        }
+        error = git_repository_head(&head, repo);
+        if (error == 0) {
+            const char *name = git_reference_name(head);
+            int written = snprintf(spec, sizeof(spec), "%s:%s", name ? name : "HEAD",
+                                   name ? name : "refs/heads/main");
+            if (written < 0 || (size_t)written >= sizeof(spec)) {
+                error = GIT_EINVALIDSPEC;
+            }
+        }
+    }
+    if (error == 0) {
+        git_strarray refspecs = {0};
+        char *spec_ptr = spec;
+        refspecs.strings = &spec_ptr;
+        refspecs.count = 1;
+        git_push_options opts = GIT_PUSH_OPTIONS_INIT;
+        apply_auth(&opts.callbacks, &auth);
+        error = git_remote_push(remote, &refspecs, &opts);
+    }
+    if (head) {
+        git_reference_free(head);
+    }
+    if (remote) {
+        git_remote_free(remote);
+    }
+    unlock_repo(r);
+    if (error < 0) {
+        return make_git_error(env, error, "push failed");
+    }
+    return ATOM_OK;
+}
+
 static ERL_NIF_TERM nif_workdir(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     (void)argc;
@@ -1226,6 +1542,10 @@ static ErlNifFunc nif_funcs[] = {
     {"branches", 1, nif_branches, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"create_branch", 3, nif_create_branch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"checkout", 3, nif_checkout, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"clone", 3, nif_clone, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"fetch", 3, nif_fetch, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"pull", 3, nif_pull, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"push", 3, nif_push, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"workdir", 1, nif_workdir, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
@@ -1270,6 +1590,11 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     ATOM_NOTHING_TO_COMMIT = enif_make_atom(env, "nothing_to_commit");
     ATOM_CLOSED = enif_make_atom(env, "closed");
     ATOM_NOMEM = enif_make_atom(env, "enomem");
+    ATOM_AUTH = enif_make_atom(env, "auth");
+    ATOM_FAST_FORWARD = enif_make_atom(env, "fast_forward");
+    ATOM_UP_TO_DATE = enif_make_atom(env, "up_to_date");
+    ATOM_USERNAME = enif_make_atom(env, "username");
+    ATOM_PASSWORD = enif_make_atom(env, "password");
 
     LOCK_TABLE_MUTEX = enif_mutex_create("ex_git_lock_table");
     if (!LOCK_TABLE_MUTEX) {
