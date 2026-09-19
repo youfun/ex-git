@@ -1743,7 +1743,6 @@ static ErlNifFunc nif_funcs[] = {
 static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
     (void)priv_data;
-    (void)load_info;
 
     ATOM_OK = enif_make_atom(env, "ok");
     ATOM_ERROR = enif_make_atom(env, "error");
@@ -1789,8 +1788,24 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     ATOM_URL = enif_make_atom(env, "url");
     ATOM_EXISTS = enif_make_atom(env, "exists");
 
+    char cacertfile[PATH_BUFSZ];
+    int has_cacertfile = !enif_is_identical(load_info, ATOM_NIL);
+    if (has_cacertfile &&
+        !inspect_cstr(env, load_info, cacertfile, sizeof(cacertfile))) {
+        return -1;
+    }
+    if (git_libgit2_init() < 0) {
+        return -1;
+    }
+    if (has_cacertfile &&
+        git_libgit2_opts(GIT_OPT_SET_SSL_CERT_LOCATIONS, cacertfile, NULL) < 0) {
+        git_libgit2_shutdown();
+        return -1;
+    }
+
     LOCK_TABLE_MUTEX = enif_mutex_create("ex_git_lock_table");
     if (!LOCK_TABLE_MUTEX) {
+        git_libgit2_shutdown();
         return -1;
     }
 
@@ -1805,10 +1820,12 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
         (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER),
         NULL);
     if (!REPO_RESOURCE) {
+        enif_mutex_destroy(LOCK_TABLE_MUTEX);
+        LOCK_TABLE_MUTEX = NULL;
+        git_libgit2_shutdown();
         return -1;
     }
 
-    git_libgit2_init();
     return 0;
 }
 

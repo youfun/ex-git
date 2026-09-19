@@ -5,9 +5,10 @@ defmodule ExGit.NIF do
   @nif_name ~c"ex_git_nif"
 
   def load_nif do
-    path = :filename.join(priv_dir(), @nif_name)
+    path = Application.get_env(:ex_git, :nif_path, :filename.join(priv_dir(), @nif_name))
+    cacertfile = Application.get_env(:ex_git, :cacertfile)
 
-    case :erlang.load_nif(path, 0) do
+    case :erlang.load_nif(to_charlist(path), cacertfile) do
       :ok -> :ok
       {:error, {:reload, _}} -> :ok
       {:error, reason} -> {:error, reason}
