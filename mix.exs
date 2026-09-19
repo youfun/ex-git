@@ -4,7 +4,7 @@ defmodule ExGit.MixProject do
   def project do
     [
       app: :ex_git,
-      version: "0.0.2",
+      version: "0.0.3",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),

@@ -7,8 +7,11 @@ defmodule ExGit do
       init/open → status/diff → add/reset → commit/log → branch/checkout
 
   HTTPS and local remotes support clone/fetch/push and fast-forward pull.
-  Credentials are passed per call and never written to the remote URL, logs,
-  or Git config. SSH and merge commits are out of scope.
+  Local `init` repositories can `remote_add` an origin and push; a successful
+  push sets upstream so the next `pull` works. Credentials are passed per
+  call and never written to the remote URL, logs, or Git config. A password
+  (PAT) alone is sent as GitHub's `x-access-token` username. SSH and merge
+  commits are out of scope.
 
   Mutating calls on the same on-disk repository are serialized across
   handles. A handle is bound to the process that opened it.
@@ -52,6 +55,8 @@ defmodule ExGit do
         }
 
   @type branch :: %{name: String.t(), current?: boolean()}
+
+  @type remote :: %{name: String.t(), url: String.t()}
 
   @doc "True once the libgit2 NIF is loaded."
   @spec nif_loaded?() :: boolean()
@@ -203,7 +208,15 @@ defmodule ExGit do
 
   `url` must be `http://`, `https://`, `file://`, or a local filesystem path.
   Optional `username`/`password` are supplied through libgit2's credential
-  callback and are never written into the URL.
+  callback and are never written into the URL. A password (PAT) without
+  `username` is sent as GitHub username `x-access-token`.
+
+  All network operations accept `:credential_endpoint` (scheme, host and optional
+  port, without a path) to check fresh authentication challenges, including push
+  targets. This disables cross-host redirects, NOT same-host port/path redirects:
+  libgit2 may replay accepted credentials on other ports of the same hostname.
+  Only use it with a hostname whose services are all trusted. HTTPS downgrades
+  are rejected by libgit2; callers handling secrets should require HTTPS.
   """
   @spec clone(String.t(), path(), keyword()) :: {:ok, repo()} | error()
   def clone(url, path, opts \\ []) when is_binary(url) and is_binary(path) do
@@ -227,10 +240,40 @@ defmodule ExGit do
     decode(NIF.pull(ref, remote_name(opts), auth_term(opts)))
   end
 
-  @doc "Push the configured refspecs of `remote` (default `origin`)."
+  @doc """
+  Push the current branch to `remote` (default `origin`).
+
+  On success, sets the branch upstream to `remote/<branch>` so a later
+  `pull/2` can fast-forward. Detached `HEAD` is pushed without changing
+  upstream.
+  """
   @spec push(repo(), keyword()) :: :ok | error()
   def push(%Repo{ref: ref}, opts \\ []) do
     decode(NIF.push(ref, remote_name(opts), auth_term(opts)))
+  end
+
+  @doc "List remotes as `%{name, url}` maps."
+  @spec remotes(repo()) :: {:ok, [remote()]} | error()
+  def remotes(%Repo{ref: ref}), do: decode(NIF.remotes(ref))
+
+  @doc """
+  Add a named remote.
+
+  `url` must be `http://`, `https://`, `file://`, or a local filesystem path.
+  Two-argument form uses the name `origin`.
+  """
+  @spec remote_add(repo(), String.t()) :: :ok | error()
+  def remote_add(repo, url) when is_binary(url), do: remote_add(repo, "origin", url)
+
+  @spec remote_add(repo(), String.t(), String.t()) :: :ok | error()
+  def remote_add(%Repo{ref: ref}, name, url) when is_binary(name) and is_binary(url) do
+    decode(NIF.remote_add(ref, name, url))
+  end
+
+  @doc "Change the fetch URL of an existing remote."
+  @spec remote_set_url(repo(), String.t(), String.t()) :: :ok | error()
+  def remote_set_url(%Repo{ref: ref}, name, url) when is_binary(name) and is_binary(url) do
+    decode(NIF.remote_set_url(ref, name, url))
   end
 
   defp wrap_repo({:ok, ref}) when is_reference(ref), do: {:ok, %Repo{ref: ref}}
@@ -265,13 +308,17 @@ defmodule ExGit do
   defp remote_name(opts), do: Keyword.get(opts, :remote, "origin")
 
   defp auth_term(opts) do
-    user = Keyword.get(opts, :username)
     pass = Keyword.get(opts, :password)
+    user = Keyword.get(opts, :username)
 
-    if is_binary(user) and is_binary(pass) do
-      %{username: user, password: pass}
-    else
-      nil
+    if is_binary(pass) and pass != "" do
+      user = if is_binary(user) and user != "", do: user, else: "x-access-token"
+      auth = %{username: user, password: pass}
+
+      case Keyword.fetch(opts, :credential_endpoint) do
+        {:ok, origin} -> Map.put(auth, :url, origin)
+        :error -> auth
+      end
     end
   end
 end

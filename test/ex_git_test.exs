@@ -233,6 +233,68 @@ defmodule ExGitTest do
     assert GitCLI.rev_parse!(dir, "HEAD") in Enum.map(results, &elem(&1, 1))
   end
 
+  test "init remote_add push sets origin and upstream for pull", %{dir: dir} do
+    origin = Path.join(dir, "origin.git")
+    work = Path.join(dir, "work")
+    clone_b = Path.join(dir, "b")
+    File.mkdir_p!(origin)
+    GitCLI.git!(dir, ["-c", "init.defaultBranch=main", "init", "--bare", origin])
+
+    assert {:ok, repo} = ExGit.init(work)
+    GitCLI.write!(work, "README", "v1\n")
+    assert :ok = ExGit.add(repo, "README")
+    assert {:ok, _} = ExGit.commit(repo, "v1", @identity)
+
+    assert {:error, {:invalid, _}} =
+             ExGit.remote_add(repo, "origin", "ssh://git@github.com/owner/repo.git")
+
+    assert :ok = ExGit.remote_add(repo, origin)
+    assert {:error, {:exists, _}} = ExGit.remote_add(repo, "origin", origin)
+    assert {:ok, remotes} = ExGit.remotes(repo)
+    assert [%{name: "origin", url: url}] = remotes
+    assert Path.expand(url) |> realpath() == Path.expand(origin) |> realpath()
+
+    other = Path.join(dir, "other.git")
+    File.mkdir_p!(other)
+    GitCLI.git!(dir, ["-c", "init.defaultBranch=main", "init", "--bare", other])
+    assert :ok = ExGit.remote_set_url(repo, "origin", other)
+    assert {:ok, [%{name: "origin", url: other_url}]} = ExGit.remotes(repo)
+    assert Path.expand(other_url) |> realpath() == Path.expand(other) |> realpath()
+    assert :ok = ExGit.remote_set_url(repo, "origin", origin)
+
+    assert :ok = ExGit.push(repo, password: "github_pat_unused_locally")
+    assert :up_to_date = ExGit.pull(repo)
+
+    assert {:ok, repo_b} = ExGit.clone(origin, clone_b)
+    assert File.read!(Path.join(clone_b, "README")) == "v1\n"
+    assert :up_to_date = ExGit.pull(repo_b)
+  end
+
+  @tag :github
+  test "https clone and push to GitHub with token-only auth" do
+    url = System.fetch_env!("EX_GIT_GITHUB_URL")
+    token = System.fetch_env!("EX_GIT_GITHUB_TOKEN")
+    dir = GitCLI.tmp_dir("github")
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    clone_a = Path.join(dir, "a")
+    assert {:ok, repo} = ExGit.clone(url, clone_a, password: token)
+
+    branch = "ex-git-#{System.unique_integer([:positive])}"
+    assert :ok = ExGit.create_branch(repo, branch)
+    assert :ok = ExGit.checkout(repo, branch)
+    GitCLI.write!(clone_a, "ex-git-probe.txt", branch <> "\n")
+    assert :ok = ExGit.add(repo, "ex-git-probe.txt")
+    assert {:ok, _} = ExGit.commit(repo, "ex-git probe #{branch}", @identity)
+    assert :ok = ExGit.push(repo, password: token)
+
+    clone_b = Path.join(dir, "b")
+    assert {:ok, repo_b} = ExGit.clone(url, clone_b, password: token)
+    assert :ok = ExGit.fetch(repo_b, password: token)
+    assert :ok = ExGit.checkout(repo_b, "origin/#{branch}")
+    assert File.read!(Path.join(clone_b, "ex-git-probe.txt")) == branch <> "\n"
+  end
+
   test "clone fetch pull and push work against a local origin", %{dir: dir} do
     seed = Path.join(dir, "seed")
     origin = Path.join(dir, "origin.git")

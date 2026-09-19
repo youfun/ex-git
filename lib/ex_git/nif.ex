@@ -31,6 +31,9 @@ defmodule ExGit.NIF do
   def fetch(_repo, _remote, _auth), do: :erlang.nif_error(:nif_not_loaded)
   def pull(_repo, _remote, _auth), do: :erlang.nif_error(:nif_not_loaded)
   def push(_repo, _remote, _auth), do: :erlang.nif_error(:nif_not_loaded)
+  def remotes(_repo), do: :erlang.nif_error(:nif_not_loaded)
+  def remote_add(_repo, _name, _url), do: :erlang.nif_error(:nif_not_loaded)
+  def remote_set_url(_repo, _name, _url), do: :erlang.nif_error(:nif_not_loaded)
   def workdir(_repo), do: :erlang.nif_error(:nif_not_loaded)
 
   defp priv_dir do

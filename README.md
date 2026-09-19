@@ -36,9 +36,20 @@ Remote HTTPS:
 
 | Function | Notes |
 | --- | --- |
-| `clone/3` | `http(s)` or local path. Optional `username`/`password` via callback |
-| `fetch/2`, `push/2` | Default remote `origin` |
+| `clone/3` | `http(s)` or local path. Optional `username`/`password` via callback. A PAT alone uses username `x-access-token` |
+| `remote_add/2`, `remote_add/3`, `remote_set_url/3`, `remotes/1` | Add or rewrite an `http(s)` / local remote. Two-arg `remote_add` names it `origin` |
+| `fetch/2`, `push/2` | Default remote `origin`. Push sets upstream on the current branch |
 | `pull/2` | Fetch + fast-forward only |
+
+GitHub from a local `init`:
+
+```elixir
+{:ok, repo} = ExGit.init(workspace)
+:ok = ExGit.add(repo, ["README.md"])
+{:ok, _} = ExGit.commit(repo, "first", name: "Agent", email: "agent@local")
+:ok = ExGit.remote_add(repo, "https://github.com/owner/repo.git")
+:ok = ExGit.push(repo, password: System.fetch_env!("GITHUB_TOKEN"))
+```
 
 Not supported: SSH, merge commits, tokens in the URL.
 
@@ -67,6 +78,8 @@ end
 mix deps.get
 mix test
 ```
+
+A GitHub HTTPS probe is skipped unless both `EX_GIT_GITHUB_URL` (an HTTPS repo the token can push to) and `EX_GIT_GITHUB_TOKEN` are set. It creates a unique branch and does not delete it.
 
 Mobile ABI packaging lives under `native/android` and `native/ios`. Those
 cross-builds are not required for desktop development.

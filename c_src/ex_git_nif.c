@@ -1,11 +1,13 @@
 #include <erl_nif.h>
 #include <git2.h>
+#include <git2/sys/errors.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PATH_BUFSZ 4096
 #define HEX_BUFSZ (GIT_OID_MAX_HEXSIZE + 1)
+#define MAX_CRED_ATTEMPTS 3
 
 typedef struct repo_lock {
     char *key;
@@ -66,6 +68,8 @@ static ERL_NIF_TERM ATOM_FAST_FORWARD;
 static ERL_NIF_TERM ATOM_UP_TO_DATE;
 static ERL_NIF_TERM ATOM_USERNAME;
 static ERL_NIF_TERM ATOM_PASSWORD;
+static ERL_NIF_TERM ATOM_URL;
+static ERL_NIF_TERM ATOM_EXISTS;
 
 static ERL_NIF_TERM make_binary(ErlNifEnv *env, const char *str)
 {
@@ -105,6 +109,8 @@ static ERL_NIF_TERM git_code_atom(int error)
         return ATOM_UNBORN;
     case GIT_EAUTH:
         return ATOM_AUTH;
+    case GIT_EEXISTS:
+        return ATOM_EXISTS;
     default:
         return ATOM_ERROR;
     }
@@ -1206,6 +1212,7 @@ static ERL_NIF_TERM nif_checkout(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 typedef struct {
     char username[256];
     char password[1024];
+    char credential_url[PATH_BUFSZ];
     int has_userpass;
     int asked;
 } ex_git_auth;
@@ -1230,6 +1237,12 @@ static int parse_auth(ErlNifEnv *env, ERL_NIF_TERM term, ex_git_auth *auth)
         !inspect_cstr(env, pass_term, auth->password, sizeof(auth->password))) {
         return 0;
     }
+    ERL_NIF_TERM url_term;
+    if (enif_get_map_value(env, term, ATOM_URL, &url_term) &&
+        (!inspect_cstr(env, url_term, auth->credential_url, sizeof(auth->credential_url)) ||
+         auth->credential_url[0] == 0)) {
+        return 0;
+    }
     auth->has_userpass = 1;
     return 1;
 }
@@ -1237,15 +1250,22 @@ static int parse_auth(ErlNifEnv *env, ERL_NIF_TERM term, ex_git_auth *auth)
 static int credential_cb(git_credential **out, const char *url, const char *username_from_url,
                          unsigned int allowed_types, void *payload)
 {
-    (void)url;
     ex_git_auth *auth = payload;
-    if (!auth || !auth->has_userpass || auth->asked) {
+    if (!auth || !auth->has_userpass || auth->asked >= MAX_CRED_ATTEMPTS) {
         return GIT_PASSTHROUGH;
+    }
+    if (auth->credential_url[0]) {
+        size_t origin_len = strlen(auth->credential_url);
+        if (!url || strncmp(url, auth->credential_url, origin_len) != 0 ||
+            (url[origin_len] != '/' && url[origin_len] != '\0')) {
+            git_error_set(GIT_ERROR_NET, "credential endpoint mismatch");
+            return GIT_EAUTH;
+        }
     }
     if (!(allowed_types & GIT_CREDENTIAL_USERPASS_PLAINTEXT)) {
         return GIT_PASSTHROUGH;
     }
-    auth->asked = 1;
+    auth->asked++;
     const char *user = auth->username[0] ? auth->username : (username_from_url ? username_from_url : "");
     return git_credential_userpass_plaintext_new(out, user, auth->password);
 }
@@ -1271,6 +1291,159 @@ static int url_is_allowed(const char *url)
     return url[0] == '/' || url[0] == '.';
 }
 
+static int set_push_upstream(git_repository *repo, const char *remote_name, git_reference *head)
+{
+    const char *branch_name = NULL;
+    char track_ref[PATH_BUFSZ];
+    char upstream[PATH_BUFSZ];
+    git_reference *tracking = NULL;
+    const git_oid *oid = NULL;
+    int written = 0;
+    int error = 0;
+
+    if (!repo || !remote_name || !remote_name[0] || !head) {
+        return 0;
+    }
+    if (!git_reference_is_branch(head)) {
+        return 0;
+    }
+    if (git_branch_name(&branch_name, head) < 0 || !branch_name || !branch_name[0]) {
+        return 0;
+    }
+    oid = git_reference_target(head);
+    if (!oid) {
+        return 0;
+    }
+
+    written = snprintf(track_ref, sizeof(track_ref), "refs/remotes/%s/%s", remote_name, branch_name);
+    if (written < 0 || (size_t)written >= sizeof(track_ref)) {
+        return GIT_EINVALIDSPEC;
+    }
+    written = snprintf(upstream, sizeof(upstream), "%s/%s", remote_name, branch_name);
+    if (written < 0 || (size_t)written >= sizeof(upstream)) {
+        return GIT_EINVALIDSPEC;
+    }
+
+    error = git_reference_create(&tracking, repo, track_ref, oid, 1, "ex_git: update tracking");
+    if (tracking) {
+        git_reference_free(tracking);
+    }
+    if (error < 0) {
+        return error;
+    }
+    return git_branch_set_upstream(head, upstream);
+}
+
+static ERL_NIF_TERM nif_remotes(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    if (!get_repo(env, argv[0], &r)) {
+        return enif_make_badarg(env);
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    git_strarray list = {0};
+    int error = git_remote_list(&list, repo);
+    if (error < 0) {
+        unlock_repo(r);
+        return make_git_error(env, error, "remote list failed");
+    }
+
+    ERL_NIF_TERM entries = enif_make_list(env, 0);
+    for (size_t i = list.count; i > 0; i--) {
+        const char *name = list.strings[i - 1];
+        if (!name) {
+            continue;
+        }
+        git_remote *remote = NULL;
+        if (git_remote_lookup(&remote, repo, name) < 0) {
+            continue;
+        }
+        const char *url = git_remote_url(remote);
+        ERL_NIF_TERM map;
+        ERL_NIF_TERM keys[2] = {ATOM_NAME, ATOM_URL};
+        ERL_NIF_TERM vals[2] = {make_binary(env, name), make_binary(env, url ? url : "")};
+        enif_make_map_from_arrays(env, keys, vals, 2, &map);
+        entries = enif_make_list_cell(env, map, entries);
+        git_remote_free(remote);
+    }
+
+    git_strarray_dispose(&list);
+    unlock_repo(r);
+    return make_ok(env, entries);
+}
+
+static ERL_NIF_TERM nif_remote_add(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    char name[256];
+    char url[PATH_BUFSZ];
+    if (!get_repo(env, argv[0], &r) ||
+        !inspect_cstr(env, argv[1], name, sizeof(name)) ||
+        !inspect_cstr(env, argv[2], url, sizeof(url))) {
+        return enif_make_badarg(env);
+    }
+    if (name[0] == 0) {
+        return make_error_term(env, ATOM_INVALID, "remote name is required");
+    }
+    if (!url_is_allowed(url)) {
+        return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    git_remote *remote = NULL;
+    int error = git_remote_create(&remote, repo, name, url);
+    if (remote) {
+        git_remote_free(remote);
+    }
+    unlock_repo(r);
+    if (error < 0) {
+        return make_git_error(env, error, "remote add failed");
+    }
+    return ATOM_OK;
+}
+
+static ERL_NIF_TERM nif_remote_set_url(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    ex_git_repo *r;
+    char name[256];
+    char url[PATH_BUFSZ];
+    if (!get_repo(env, argv[0], &r) ||
+        !inspect_cstr(env, argv[1], name, sizeof(name)) ||
+        !inspect_cstr(env, argv[2], url, sizeof(url))) {
+        return enif_make_badarg(env);
+    }
+    if (name[0] == 0) {
+        return make_error_term(env, ATOM_INVALID, "remote name is required");
+    }
+    if (!url_is_allowed(url)) {
+        return make_error_term(env, ATOM_INVALID, "only http(s) and local remotes are supported");
+    }
+
+    git_repository *repo = lock_repo(r);
+    if (!repo) {
+        return make_error_term(env, ATOM_CLOSED, "repository is closed");
+    }
+
+    int error = git_remote_set_url(repo, name, url);
+    unlock_repo(r);
+    if (error < 0) {
+        return make_git_error(env, error, "remote set-url failed");
+    }
+    return ATOM_OK;
+}
+
 static ERL_NIF_TERM nif_clone(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     (void)argc;
@@ -1288,6 +1461,9 @@ static ERL_NIF_TERM nif_clone(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
 
     git_clone_options opts = GIT_CLONE_OPTIONS_INIT;
     apply_auth(&opts.fetch_opts.callbacks, &auth);
+    if (auth.credential_url[0]) {
+        opts.fetch_opts.follow_redirects = GIT_REMOTE_REDIRECT_NONE;
+    }
 
     git_repository *repo = NULL;
     int error = git_clone(&repo, url, path, &opts);
@@ -1328,6 +1504,9 @@ static ERL_NIF_TERM nif_fetch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
         }
         git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
         apply_auth(&opts.callbacks, &auth);
+        if (auth.credential_url[0]) {
+            opts.follow_redirects = GIT_REMOTE_REDIRECT_NONE;
+        }
         error = git_remote_fetch(remote, NULL, &opts, "fetch");
     }
     if (remote) {
@@ -1378,6 +1557,9 @@ static ERL_NIF_TERM nif_pull(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (error == 0) {
         git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
         apply_auth(&opts.callbacks, &auth);
+        if (auth.credential_url[0]) {
+            opts.follow_redirects = GIT_REMOTE_REDIRECT_NONE;
+        }
         error = git_remote_fetch(remote, NULL, &opts, "pull");
     }
     if (error == 0) {
@@ -1497,7 +1679,13 @@ static ERL_NIF_TERM nif_push(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         refspecs.count = 1;
         git_push_options opts = GIT_PUSH_OPTIONS_INIT;
         apply_auth(&opts.callbacks, &auth);
+        if (auth.credential_url[0]) {
+            opts.follow_redirects = GIT_REMOTE_REDIRECT_NONE;
+        }
         error = git_remote_push(remote, &refspecs, &opts);
+        if (error == 0 && head) {
+            (void)set_push_upstream(repo, remote_name, head);
+        }
     }
     if (head) {
         git_reference_free(head);
@@ -1546,6 +1734,9 @@ static ErlNifFunc nif_funcs[] = {
     {"fetch", 3, nif_fetch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"pull", 3, nif_pull, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"push", 3, nif_push, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"remotes", 1, nif_remotes, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"remote_add", 3, nif_remote_add, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"remote_set_url", 3, nif_remote_set_url, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"workdir", 1, nif_workdir, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
@@ -1595,6 +1786,8 @@ static int on_load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     ATOM_UP_TO_DATE = enif_make_atom(env, "up_to_date");
     ATOM_USERNAME = enif_make_atom(env, "username");
     ATOM_PASSWORD = enif_make_atom(env, "password");
+    ATOM_URL = enif_make_atom(env, "url");
+    ATOM_EXISTS = enif_make_atom(env, "exists");
 
     LOCK_TABLE_MUTEX = enif_mutex_create("ex_git_lock_table");
     if (!LOCK_TABLE_MUTEX) {
